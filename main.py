@@ -8,6 +8,7 @@ import websockets
 from rtu.ddsu import read_ddsu
 from rtu.pzem import read_pzem
 from rtu.sht import read_sht
+from rtu.em619001 import read_em619001   # NEW
 
 
 from config import (
@@ -17,6 +18,8 @@ from config import (
     POLL_INTERVAL,
     PZEM_IDS,
     SHT_IDS,
+    EM619001_PV_IDS,        # NEW
+    EM619001_BAT_IDS,       # NEW
     WS_HOST,
     WS_PORT,
 )
@@ -48,108 +51,47 @@ latest_data = {}
 
 # =========================
 # Data Format
-# ========================
+# =========================
 # {
 #   "ts": 1697049600,
 #   "data": [
-#       "{
-#           "id": 1,
+#       {
+#           "id": 2,
 #           "type": "DDSU",
-#           "data": {
-#               "voltage": 230.5,
-#               "current": 5.2,
-#               "power": 1200.0,
-#               "energy": 15000.0,
-#               "frequency": 50.0,
-#               "power_factor": 0.95
-#           },
-#       },
-#       ...,
-#       {
-#           "id": 7,
-#           "type": "PZEM",
-#           "data": {
-#               "voltage": 230.5,
-#               "current": 5.2,
-#               "power": 1200.0,
-#               "energy": 15000.0,
-#           },
+#           "data": {...}
 #       },
 #       {
-#           "id": 7,
-#           "type": "PZEM",
+#           "id": 10,
+#           "type": "EM619001_PV",
 #           "data": {
-#               "voltage": 230.5,
-#               "current": 5.2,
-#               "power": 1200.0,
-#               "energy": 15000.0,
-#           },
+#               "voltage": 380.5,
+#               "current": 7.483,
+#               "power": 2845.3,
+#               "energy_total": 1234.56,
+#               "energy_forward": 1234.56,
+#               "energy_reverse": 0.0,
+#               "alarm_status": 0
+#           }
 #       },
 #       {
-#           "id": 8,
-#           "type": "SHT",
+#           "id": 20,
+#           "type": "EM619001_BAT",
 #           "data": {
-#               "temperature": 25.5,
-#               "humidity": 60.0
-#           },
-#       },
+#               "voltage": 51.2,
+#               "current": -25.3,        // negative = discharging
+#               "power": -1295.4,        // negative = discharging
+#               "energy_total": 44.1,
+#               "energy_forward": 856.2, // total charge
+#               "energy_reverse": 812.1, // total discharge
+#               "alarm_status": 0
+#           }
+#       }
 #   ]
 # }
 # =========================
+
 
 hour_bucket = {}
-
-# =========================
-# Data Format
-# ========================
-# {
-#   "ts": 1697049600,
-#   "count": 12,
-#   "data": [
-#       "{
-#           "id": 1,
-#           "type": "DDSU",
-#           "data": {
-#               "voltage": 2766,
-#               "current": 62.4,
-#               "power": 14400.0,
-#               "energy": 360000.0,
-#               "frequency": 6000,
-#               "power_factor": 11.4,
-#           },
-#       },
-#       ...,
-#       {
-#           "id": 7,
-#           "type": "PZEM",
-#           "data": {
-#               "voltage": 2766,
-#               "current": 62.4,
-#               "power": 14400.0,
-#               "energy": 360000.0,
-#           },
-#       },
-#       {
-#           "id": 7,
-#           "type": "PZEM",
-#           "data": {
-#               "voltage": 2766,
-#               "current": 62.4,
-#               "power": 14400.0,
-#               "energy": 360000.0,
-#           },
-#       },
-#       {
-#           "id": 8,
-#           "type": "SHT",
-#           "data": {
-#               "temperature": 255,
-#               "humidity": 600
-#           },
-#       },
-#   ]
-# }
-# =========================
 
 
 async def flush_bucket(bucket):
@@ -176,6 +118,14 @@ async def flush_bucket(bucket):
         elif entry["type"] == "SHT":
             url = f"http://{BACKEND_HOST}:{BACKEND_PORT}/api/v1/shts/create"
 
+        # NEW: EM619001 PV (unidirectional)
+        elif entry["type"] == "EM619001_PV":
+            url = f"http://{BACKEND_HOST}:{BACKEND_PORT}/api/v1/em619001-pv/create"
+
+        # NEW: EM619001 Battery (bidirectional)
+        elif entry["type"] == "EM619001_BAT":
+            url = f"http://{BACKEND_HOST}:{BACKEND_PORT}/api/v1/em619001-bat/create"
+
         else:
             continue
 
@@ -201,12 +151,18 @@ async def update_bucket(payload):
     hour_bucket["count"] += 1
 
     for incoming in payload["data"]:
+        # Skip empty data (failed reads)
+        if not incoming.get("data"):
+            continue
+
         found = False
 
         for stored in hour_bucket["data"]:
             if stored["id"] == incoming["id"] and stored["type"] == incoming["type"]:
                 for k, v in incoming["data"].items():
-                    stored["data"][k] += v
+                    # Skip non-numeric fields (alarm_status is int but we treat carefully)
+                    if isinstance(v, (int, float)):
+                        stored["data"][k] = stored["data"].get(k, 0) + v
                 found = True
                 break
 
@@ -226,26 +182,35 @@ async def update_bucket(payload):
 
 
 async def modbus_reader():
-    timestamp = int(time.time())
-
     while True:
         try:
+            timestamp = int(time.time())
             data = []
 
-            # Read DDSU meters
+            # Read DDSU meters (AC)
             for sid in DDSU_IDS:
                 ddsu_data = await read_ddsu(sid)
                 data.append({"id": sid, "type": "DDSU", "data": ddsu_data})
 
-            # Read PZEM meter
+            # Read PZEM meter (AC)
             for sid in PZEM_IDS:
                 pzem_data = await read_pzem(sid)
                 data.append({"id": sid, "type": "PZEM", "data": pzem_data})
 
-            # Read SHT sensor
+            # Read SHT sensor (environmental)
             for sid in SHT_IDS:
                 sht_data = await read_sht(sid)
                 data.append({"id": sid, "type": "SHT", "data": sht_data})
+
+            # NEW: Read EM619001 PV meters (DC, unidirectional)
+            for sid in EM619001_PV_IDS:
+                em_data = await read_em619001(sid)
+                data.append({"id": sid, "type": "EM619001_PV", "data": em_data})
+
+            # NEW: Read EM619001 Battery meters (DC, bidirectional)
+            for sid in EM619001_BAT_IDS:
+                em_data = await read_em619001(sid)
+                data.append({"id": sid, "type": "EM619001_BAT", "data": em_data})
 
             global latest_data
             latest_data = {"ts": timestamp, "data": data}
